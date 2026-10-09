@@ -4,6 +4,9 @@ A tiny, **key-free** terminal market report for crypto. It pulls public data fro
 exchange APIs (no API keys, no auth) and renders a readable report right in your
 shell.
 
+Aggregates funding rates from six venues — Binance Futures, Bybit, Gate.io,
+Bitget, MEXC, and Kraken — plus Binance spot OHLCV and CoinGecko global stats.
+
 Built with the Python standard library + `aiohttp` only — typed, async, and
 defensive: if any data source is slow or down, it simply prints `UNAVAILABLE`
 and the rest of the report still renders.
@@ -24,21 +27,25 @@ pip install pytest pytest-asyncio
 ## Usage
 
 ```bash
-python crypto_pulse.py funding   # Top 15 most extreme funding rates
-python crypto_pulse.py vol       # BTC 30d realized vol, momentum, price range
-python crypto_pulse.py report    # Full terminal market report
+python crypto_pulse.py funding                       # Top 15 most extreme funding rates
+python crypto_pulse.py funding --venue bitget        # Top 15 for Bitget only (case-insensitive)
+python crypto_pulse.py vol                           # BTC 30d realized vol, momentum, price range
+python crypto_pulse.py report                        # Full terminal market report
 ```
 
 ### Commands
 
 #### `funding`
-Aggregates perpetual-swap funding rates from Binance Futures and Bybit, ranks
-them by absolute value, and prints the top 15:
+Aggregates perpetual-swap funding rates from Binance Futures, Bybit, Gate.io,
+Bitget, MEXC, and Kraken, ranks them by absolute value, and prints the top 15:
 
 | SYMBOL | VENUE | RATE% | ANNUALIZED% |
 |--------|-------|-------|-------------|
 
-`ANNUALIZED% = rate * 3 * 365 * 100` (funding is paid 3× daily).
+`ANNUALIZED% = rate * 3 * 365 * 100` (funding is paid 3× daily). Use
+`--venue VENUE` (case-insensitive) to filter rows by venue label, e.g.
+`--venue kraken`. If every source is unreachable the command prints `UNAVAILABLE`;
+otherwise available venues still render.
 
 #### `vol`
 Fetches the last 30 daily candles for BTCUSDT from Binance spot and computes:
@@ -62,6 +69,10 @@ All free, public, no keys required:
 | Binance Futures | `https://fapi.binance.com/fapi/v1/premiumIndex` (funding rates) |
 | Binance Spot | `https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1d&limit=30` (BTC candles) |
 | Bybit v5 | `https://api.bybit.com/v5/market/tickers?category=linear` (funding rates) |
+| Gate.io | `https://api.gateio.ws/api/v4/futures/usdt/contracts` (funding rates) |
+| Bitget | `https://api.bitget.com/api/v2/mix/market/tickers?productType=USDT-FUTURES` (funding rates) |
+| MEXC | `https://contract.mexc.com/api/v1/contract/funding_rate` (funding rates) |
+| Kraken | `https://futures.kraken.com/derivatives/api/v3/tickers` (funding rates, perpetuals only) |
 | CoinGecko | `https://api.coingecko.com/api/v3/global` (global market cap, BTC dominance) |
 
 Each request uses an 8-second timeout and is wrapped in its own `try/except`,

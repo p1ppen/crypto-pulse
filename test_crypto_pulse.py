@@ -71,6 +71,41 @@ BYBIT_FUNDING_JSON = {
         ]
     },
 }
+# Gate.io returns a bare JSON list; field names differ ("name", "funding_rate").
+GATE_FUNDING_JSON = [
+    {"name": "BTC_USDT", "funding_rate": 0.000019},
+    {"name": "ETH_USDT", "funding_rate": -0.000045},
+    {"name": "BAD_RATE", "funding_rate": "not-a-number"},  # bad rate skipped
+    {"name": "MISSING_RATE", "funding_rate": None},  # missing rate skipped
+    {"funding_rate": 0.0001},  # missing name skipped
+    "not-a-dict",  # non-dict skipped
+]
+# Bitget wraps in {"code","data"}; rate is a string.
+BITGET_FUNDING_JSON = {
+    "code": "00000",
+    "data": [
+        {"symbol": "BTCUSDT", "fundingRate": "0.000045"},  # string rate
+        {"symbol": "ETHUSDT", "fundingRate": "-0.000020"},  # string, negative
+    ],
+}
+# MEXC wraps in {"success","code","data"}; rate is a float.
+MEXC_FUNDING_JSON = {
+    "success": True,
+    "code": 0,
+    "data": [
+        {"symbol": "BTC_USDT", "fundingRate": 0.000030},  # float rate
+        {"symbol": "ETH_USDT", "fundingRate": -0.000050},  # float, negative
+    ],
+}
+# Kraken: only tickers with tag == "perpetual" are kept; rate is a float.
+KRAKEN_FUNDING_JSON = {
+    "tickers": [
+        {"symbol": "PF_RENDERUSD", "tag": "perpetual", "relativeFundingRate": -0.0001, "fundingRate": -1.1958993633166e-05},
+        {"symbol": "PF_BTCUSD", "tag": "perpetual", "relativeFundingRate": 0.00005, "fundingRate": 31.8},
+        {"symbol": "PF_EXPIRY", "tag": "expiry", "relativeFundingRate": 0.0001},  # not perpetual -> filtered
+        {"symbol": "PF_NORATE", "tag": "perpetual"},  # missing rate -> skipped
+    ],
+}
 
 GLOBAL_JSON = {
     "data": {
@@ -123,6 +158,68 @@ def test_parse_bybit_funding():
     assert parsed[0].rate == 0.00005
 
 
+def test_parse_gate_funding():
+    parsed = cp.parse_gate_funding(GATE_FUNDING_JSON)
+    assert len(parsed) == 2
+    btc = next(p for p in parsed if p.symbol == "BTC_USDT")
+    assert btc.venue == "Gate"
+    assert btc.rate == 0.000019
+    eth = next(p for p in parsed if p.symbol == "ETH_USDT")
+    assert eth.rate == -0.000045  # negative funding preserved
+
+
+def test_parse_gate_funding_rejects_bad_input():
+    assert cp.parse_gate_funding({"not": "a list"}) == []
+    assert cp.parse_gate_funding(None) == []
+
+
+def test_parse_bitget_funding():
+    parsed = cp.parse_bitget_funding(BITGET_FUNDING_JSON)
+    assert len(parsed) == 2
+    btc = next(p for p in parsed if p.symbol == "BTCUSDT")
+    assert btc.venue == "Bitget"
+    assert btc.rate == 0.000045  # string rate coerced to float
+    eth = next(p for p in parsed if p.symbol == "ETHUSDT")
+    assert eth.rate == -0.000020  # negative string rate preserved
+
+
+def test_parse_bitget_funding_rejects_bad_input():
+    assert cp.parse_bitget_funding({"code": "00000", "data": "nope"}) == []
+    assert cp.parse_bitget_funding(None) == []
+
+
+def test_parse_mexc_funding():
+    parsed = cp.parse_mexc_funding(MEXC_FUNDING_JSON)
+    assert len(parsed) == 2
+    btc = next(p for p in parsed if p.symbol == "BTC_USDT")
+    assert btc.venue == "MEXC"
+    assert btc.rate == 0.000030  # float rate kept as float
+    eth = next(p for p in parsed if p.symbol == "ETH_USDT")
+    assert eth.rate == -0.000050  # negative float preserved
+
+
+def test_parse_mexc_funding_rejects_bad_input():
+    assert cp.parse_mexc_funding({"success": True, "code": 0, "data": {}}) == []
+    assert cp.parse_mexc_funding(None) == []
+
+
+def test_parse_kraken_funding_filters_non_perpetual():
+    parsed = cp.parse_kraken_funding(KRAKEN_FUNDING_JSON)
+    assert len(parsed) == 2
+    symbols = {p.symbol for p in parsed}
+    assert symbols == {"PF_RENDERUSD", "PF_BTCUSD"}
+    assert all(p.venue == "Kraken" for p in parsed)
+    render = next(p for p in parsed if p.symbol == "PF_RENDERUSD")
+    assert render.rate == pytest.approx(-0.0001 * 8)  # relative/hr x8 -> 8h normalized
+    btc = next(p for p in parsed if p.symbol == "PF_BTCUSD")
+    assert btc.rate == pytest.approx(0.00005 * 8)
+
+
+def test_parse_kraken_funding_rejects_bad_input():
+    assert cp.parse_kraken_funding({"tickers": "nope"}) == []
+    assert cp.parse_kraken_funding(None) == []
+
+
 @pytest.mark.asyncio
 async def test_funding_command_annualization():
     urls = {
@@ -143,6 +240,83 @@ async def test_funding_command_annualization():
 async def test_funding_command_all_sources_down():
     out = await cp.run_funding(FakeSession(exc=aiohttp.ClientError("down")))
     assert out == "UNAVAILABLE"
+
+
+@pytest.mark.asyncio
+async def test_funding_command_all_six_venues():
+    urls = {
+        cp.BINANCE_FAPI_URL: BINANCE_FUNDING_JSON,
+        cp.BYBIT_V5_URL: BYBIT_FUNDING_JSON,
+        cp.GATE_API_URL: GATE_FUNDING_JSON,
+        cp.BITGET_API_URL: BITGET_FUNDING_JSON,
+        cp.MEXC_API_URL: MEXC_FUNDING_JSON,
+        cp.KRAKEN_API_URL: KRAKEN_FUNDING_JSON,
+    }
+    out = await cp.run_funding(FakeSession(urls))
+    assert "UNAVAILABLE" not in out
+    venues = {"Binance", "Bybit", "Gate", "Bitget", "MEXC", "Kraken"}
+    for v in venues:
+        assert v in out
+    assert "BTCUSDT" in out and "BTC_USDT" in out and "PF_RENDERUSD" in out
+
+
+@pytest.mark.asyncio
+async def test_funding_command_one_source_down_rest_render():
+    # Gate URL not canned -> FakeSession raises -> Gate omitted; others render.
+    urls = {
+        cp.BINANCE_FAPI_URL: BINANCE_FUNDING_JSON,
+        cp.BYBIT_V5_URL: BYBIT_FUNDING_JSON,
+    }
+    out = await cp.run_funding(FakeSession(urls))
+    assert "UNAVAILABLE" not in out
+    assert "Binance" in out and "Bybit" in out
+    assert "Gate" not in out and "Kraken" not in out
+
+
+@pytest.mark.asyncio
+async def test_funding_command_venue_filter_case_insensitive():
+    urls = {
+        cp.BINANCE_FAPI_URL: BINANCE_FUNDING_JSON,
+        cp.BYBIT_V5_URL: BYBIT_FUNDING_JSON,
+        cp.GATE_API_URL: GATE_FUNDING_JSON,
+        cp.BITGET_API_URL: BITGET_FUNDING_JSON,
+        cp.MEXC_API_URL: MEXC_FUNDING_JSON,
+        cp.KRAKEN_API_URL: KRAKEN_FUNDING_JSON,
+    }
+    out = await cp.run_funding(FakeSession(urls), venue="GATE")
+    assert "UNAVAILABLE" not in out
+    assert "Gate" in out
+    assert "Binance" not in out and "Bybit" not in out
+
+
+@pytest.mark.asyncio
+async def test_funding_command_venue_no_match():
+    urls = {
+        cp.BINANCE_FAPI_URL: BINANCE_FUNDING_JSON,
+        cp.BYBIT_V5_URL: BYBIT_FUNDING_JSON,
+    }
+    out = await cp.run_funding(FakeSession(urls), venue="kraken")
+    assert out == "UNAVAILABLE"
+
+
+def test_render_funding_table_long_symbols_align():
+    long_symbol = "SUPER_LONG_PERP_TOKEN"
+    rates = [
+        cp.FundingRate(symbol=long_symbol, venue="Gate", rate=0.0005),
+        cp.FundingRate(symbol="PF_RENDERUSD", venue="Kraken", rate=-0.0003),
+    ]
+    table = cp.render_funding_table(rates, top_n=15)
+    lines = table.splitlines()
+    bar = lines[0]
+    # The bar is "─"*w0 + "  " + "─"*w1 + ...; the first segment's length is the
+    # SYMBOL column width, which must fit the longest symbol.
+    sym_width = len(bar.split("  ")[0])
+    assert sym_width >= len(long_symbol)
+    # Every data row must place the column-0 / column-1 separator ("  ") at the
+    # exact same offset => columns are aligned despite differing symbol lengths.
+    for row in lines[3:]:
+        assert row[sym_width : sym_width + 2] == "  "
+        assert row[: len(long_symbol)]  # non-empty symbol field
 
 
 # --------------------------------------------------------------------------- #

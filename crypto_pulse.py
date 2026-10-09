@@ -23,6 +23,10 @@ import aiohttp
 # --------------------------------------------------------------------------- #
 BINANCE_FAPI_URL = "https://fapi.binance.com/fapi/v1/premiumIndex"
 BYBIT_V5_URL = "https://api.bybit.com/v5/market/tickers?category=linear"
+GATE_API_URL = "https://api.gateio.ws/api/v4/futures/usdt/contracts"
+BITGET_API_URL = "https://api.bitget.com/api/v2/mix/market/tickers?productType=USDT-FUTURES"
+MEXC_API_URL = "https://contract.mexc.com/api/v1/contract/funding_rate"
+KRAKEN_API_URL = "https://futures.kraken.com/derivatives/api/v3/tickers"
 COINGECKO_GLOBAL_URL = "https://api.coingecko.com/api/v3/global"
 BINANCE_KLINES_URL = (
     "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1d&limit=30"
@@ -130,6 +134,70 @@ def parse_bybit_funding(data: Any) -> list[FundingRate]:
     return out
 
 
+def parse_gate_funding(data: Any) -> list[FundingRate]:
+    out: list[FundingRate] = []
+    if not isinstance(data, list):
+        return out
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        symbol = item.get("name")
+        rate = _safe_float(item.get("funding_rate"))
+        if symbol and rate is not None:
+            out.append(FundingRate(symbol=symbol, venue="Gate", rate=rate))
+    return out
+
+
+def parse_bitget_funding(data: Any) -> list[FundingRate]:
+    out: list[FundingRate] = []
+    payload = (data or {}).get("data", [])
+    if not isinstance(payload, list):
+        return out
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        symbol = item.get("symbol")
+        rate = _safe_float(item.get("fundingRate"))
+        if symbol and rate is not None:
+            out.append(FundingRate(symbol=symbol, venue="Bitget", rate=rate))
+    return out
+
+
+def parse_mexc_funding(data: Any) -> list[FundingRate]:
+    out: list[FundingRate] = []
+    payload = (data or {}).get("data", [])
+    if not isinstance(payload, list):
+        return out
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        symbol = item.get("symbol")
+        rate = _safe_float(item.get("fundingRate"))
+        if symbol and rate is not None:
+            out.append(FundingRate(symbol=symbol, venue="MEXC", rate=rate))
+    return out
+
+
+def parse_kraken_funding(data: Any) -> list[FundingRate]:
+    out: list[FundingRate] = []
+    tickers = (data or {}).get("tickers", [])
+    if not isinstance(tickers, list):
+        return out
+    for item in tickers:
+        if not isinstance(item, dict):
+            continue
+        if item.get("tag") != "perpetual":
+            continue
+        symbol = item.get("symbol")
+        # Kraken's "fundingRate" is an ABSOLUTE dollar amount per contract per hour.
+        # "relativeFundingRate" is the fractional rate per hour; multiply by 8 to
+        # normalize to the 8h funding interval used by all other venues.
+        rel = _safe_float(item.get("relativeFundingRate"))
+        if symbol and rel is not None:
+            out.append(FundingRate(symbol=symbol, venue="Kraken", rate=rel * 8))
+    return out
+
+
 async def fetch_binance_funding(
     session: aiohttp.ClientSession, timeout: aiohttp.ClientTimeout
 ) -> Optional[list[FundingRate]]:
@@ -156,16 +224,76 @@ async def fetch_bybit_funding(
         return None
 
 
+async def fetch_gate_funding(
+    session: aiohttp.ClientSession, timeout: aiohttp.ClientTimeout
+) -> Optional[list[FundingRate]]:
+    try:
+        data = await fetch_json(session, GATE_API_URL, timeout)
+    except Exception:
+        return None
+    try:
+        return parse_gate_funding(data)
+    except Exception:
+        return None
+
+
+async def fetch_bitget_funding(
+    session: aiohttp.ClientSession, timeout: aiohttp.ClientTimeout
+) -> Optional[list[FundingRate]]:
+    try:
+        data = await fetch_json(session, BITGET_API_URL, timeout)
+    except Exception:
+        return None
+    try:
+        return parse_bitget_funding(data)
+    except Exception:
+        return None
+
+
+async def fetch_mexc_funding(
+    session: aiohttp.ClientSession, timeout: aiohttp.ClientTimeout
+) -> Optional[list[FundingRate]]:
+    try:
+        data = await fetch_json(session, MEXC_API_URL, timeout)
+    except Exception:
+        return None
+    try:
+        return parse_mexc_funding(data)
+    except Exception:
+        return None
+
+
+async def fetch_kraken_funding(
+    session: aiohttp.ClientSession, timeout: aiohttp.ClientTimeout
+) -> Optional[list[FundingRate]]:
+    try:
+        data = await fetch_json(session, KRAKEN_API_URL, timeout)
+    except Exception:
+        return None
+    try:
+        return parse_kraken_funding(data)
+    except Exception:
+        return None
+
+
 async def gather_funding_rates(
     session: aiohttp.ClientSession, timeout: aiohttp.ClientTimeout
 ) -> Optional[list[FundingRate]]:
-    binance, bybit = await asyncio.gather(
+    results = await asyncio.gather(
         fetch_binance_funding(session, timeout),
         fetch_bybit_funding(session, timeout),
+        fetch_gate_funding(session, timeout),
+        fetch_bitget_funding(session, timeout),
+        fetch_mexc_funding(session, timeout),
+        fetch_kraken_funding(session, timeout),
     )
-    if binance is None and bybit is None:
+    if all(r is None for r in results):
         return None
-    return (binance or []) + (bybit or [])
+    combined: list[FundingRate] = []
+    for r in results:
+        if r is not None:
+            combined.extend(r)
+    return combined
 
 
 def annualized_rate(rate: float) -> float:
@@ -364,10 +492,18 @@ def render_report(
 # --------------------------------------------------------------------------- #
 # Commands
 # --------------------------------------------------------------------------- #
-async def run_funding(session: Optional[aiohttp.ClientSession] = None) -> str:
+async def run_funding(
+    session: Optional[aiohttp.ClientSession] = None,
+    venue: Optional[str] = None,
+) -> str:
     async with _session(session) as s:
         rates = await gather_funding_rates(s, REQUEST_TIMEOUT)
-    if rates is None or not rates:
+    if rates is None:
+        return "UNAVAILABLE"
+    if venue is not None:
+        want = venue.strip().lower()
+        rates = [r for r in rates if r.venue.lower() == want]
+    if not rates:
         return "UNAVAILABLE"
     return render_funding_table(rates, 15)
 
@@ -399,7 +535,17 @@ def build_parser() -> argparse.ArgumentParser:
         description="Terminal crypto market report (no API keys required).",
     )
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("funding", help="Top 15 most extreme funding rates across Binance + Bybit.")
+    funding_p = sub.add_parser(
+        "funding",
+        help="Top 15 most extreme funding rates across Binance, Bybit, Gate, "
+        "Bitget, MEXC, Kraken.",
+    )
+    funding_p.add_argument(
+        "--venue",
+        metavar="VENUE",
+        default=None,
+        help="Filter rows by venue label (case-insensitive), e.g. --venue bitget.",
+    )
     sub.add_parser("vol", help="BTC 30d realized volatility, momentum & price range.")
     sub.add_parser("report", help="Full terminal market report.")
     return parser
@@ -408,7 +554,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[list[str]] = None) -> None:
     args = build_parser().parse_args(argv)
     if args.command == "funding":
-        out = asyncio.run(run_funding())
+        out = asyncio.run(run_funding(venue=args.venue))
     elif args.command == "vol":
         out = asyncio.run(run_vol())
     elif args.command == "report":
