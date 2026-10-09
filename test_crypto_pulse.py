@@ -1,0 +1,256 @@
+"""Tests for crypto_pulse.
+
+Uses pytest + pytest-asyncio. aiohttp is mocked via unittest.mock style fake
+session objects so no real network calls are made.
+"""
+from __future__ import annotations
+
+import math
+import statistics
+from unittest.mock import MagicMock
+
+import aiohttp
+import pytest
+
+import crypto_pulse as cp
+
+
+# --------------------------------------------------------------------------- #
+# Fake aiohttp session / response
+# --------------------------------------------------------------------------- #
+class MockResponse:
+    def __init__(self, data, status: int = 200):
+        self._data = data
+        self.status = status
+
+    async def __aenter__(self) -> "MockResponse":
+        return self
+
+    async def __aexit__(self, *exc) -> bool:
+        return False
+
+    async def json(self):
+        return self._data
+
+    async def raise_for_status(self) -> None:
+        if self.status >= 400:
+            raise aiohttp.ClientResponseError(MagicMock(), MagicMock(), status=self.status)
+
+
+class FakeSession:
+    """Mimics aiohttp.ClientSession.get for testing."""
+
+    def __init__(self, data_by_url=None, exc: Exception | None = None):
+        self._data = data_by_url or {}
+        self._exc = exc
+        self.calls: list[str] = []
+
+    def get(self, url, **kwargs):
+        self.calls.append(url)
+        if self._exc is not None:
+            raise self._exc
+        for key, val in self._data.items():
+            if url.startswith(key):
+                return MockResponse(val)
+        # No canned data for this URL -> treat as unexpected.
+        raise aiohttp.ClientError(f"unexpected url: {url}")
+
+
+# --------------------------------------------------------------------------- #
+# Sample data
+# --------------------------------------------------------------------------- #
+BINANCE_FUNDING_JSON = [
+    {"symbol": "BTCUSDT", "lastFundingRate": "0.00001000"},
+    {"symbol": "ETHUSDT", "lastFundingRate": "-0.00002500"},
+]
+BYBIT_FUNDING_JSON = {
+    "retCode": 0,
+    "result": {
+        "list": [
+            {"symbol": "XRPUSDT", "fundingRate": "0.00005000"},
+        ]
+    },
+}
+
+GLOBAL_JSON = {
+    "data": {
+        "market_cap_percentage": {"btc": 42.53, "eth": 18.1},
+        "total_market_cap": {"usd": 2_840_000_000_000},
+    }
+}
+
+
+def make_klines(closes: list[float]) -> list[list]:
+    """Build synthetic OHLCV klines with a given close series."""
+    return [
+        [i, c - 0.5, c + 1.0, c - 1.0, c, 100.0, i]
+        for i, c in enumerate(closes)
+    ]
+
+
+CLOSES_30 = [100.0 * (1.001 ** i) for i in range(30)]
+KLINES_30 = make_klines(CLOSES_30)
+
+
+# --------------------------------------------------------------------------- #
+# 1) Funding annualization math
+# --------------------------------------------------------------------------- #
+def test_annualized_rate_formula():
+    assert cp.annualized_rate(0.0) == 0.0
+    assert cp.annualized_rate(0.00001) == pytest.approx(0.00001 * 3 * 365 * 100)  # 1.095
+
+
+def test_parse_binance_funding():
+    parsed = cp.parse_binance_funding(BINANCE_FUNDING_JSON)
+    assert len(parsed) == 2
+    btc = next(p for p in parsed if p.symbol == "BTCUSDT")
+    assert btc.rate == 0.00001
+    assert btc.venue == "Binance"
+
+
+def test_parse_binance_funding_dict_response():
+    # Some endpoints return a single dict; parser should wrap it.
+    parsed = cp.parse_binance_funding({"symbol": "SOLUSDT", "lastFundingRate": "0.00000100"})
+    assert len(parsed) == 1
+    assert parsed[0].symbol == "SOLUSDT"
+
+
+def test_parse_bybit_funding():
+    parsed = cp.parse_bybit_funding(BYBIT_FUNDING_JSON)
+    assert len(parsed) == 1
+    assert parsed[0].symbol == "XRPUSDT"
+    assert parsed[0].venue == "Bybit"
+    assert parsed[0].rate == 0.00005
+
+
+@pytest.mark.asyncio
+async def test_funding_command_annualization():
+    urls = {
+        cp.BINANCE_FAPI_URL: BINANCE_FUNDING_JSON,
+        cp.BYBIT_V5_URL: BYBIT_FUNDING_JSON,
+    }
+    out = await cp.run_funding(FakeSession(urls))
+    assert "UNAVAILABLE" not in out
+    # Ranked by abs rate: XRP(5e-5), ETH(2.5e-5), BTC(1e-5)
+    assert "XRPUSDT" in out
+    assert "5.47%" in out          # 0.00005 * 1095 * 100 = 5.475, float repr 5.4749... -> "5.47%"
+    assert "2.74%" in out          # 0.000025 * 1095 * 100 = 2.7375 -> "2.74%"
+    assert "1.10%" in out          # 0.00001  * 1095 * 100 = 1.095 -> "1.10%"
+    assert "-0.0025%" in out       # ETH rate%: -0.000025 * 100 = -0.0025
+
+
+@pytest.mark.asyncio
+async def test_funding_command_all_sources_down():
+    out = await cp.run_funding(FakeSession(exc=aiohttp.ClientError("down")))
+    assert out == "UNAVAILABLE"
+
+
+# --------------------------------------------------------------------------- #
+# 2) Vol computation from fixed klines
+# --------------------------------------------------------------------------- #
+def test_compute_vol_stats_momentum():
+    closes = [100.0, 101.0, 99.0, 102.0, 103.0, 100.0, 98.0, 105.0]
+    stats = cp.compute_vol_stats(make_klines(closes))
+    assert stats is not None
+    # 7d: (105 - 100) / 100
+    assert stats.momentum_7d == pytest.approx(5.0)
+    # 30d: (105 - 100) / 100
+    assert stats.momentum_30d == pytest.approx(5.0)
+    assert stats.current == 105.0
+    # high window uses k[2] = c+1.0 -> max close + 1.0; low = c-1.0
+    assert stats.high == pytest.approx(105.0 + 1.0)
+    assert stats.low == pytest.approx(98.0 - 1.0)
+
+
+def test_compute_vol_stats_volatility():
+    closes = [100.0 * (1.001 ** i) for i in range(30)]
+    stats = cp.compute_vol_stats(make_klines(closes))
+    assert stats is not None
+    log_returns = [math.log(closes[i] / closes[i - 1]) for i in range(1, len(closes))]
+    expected_vol = statistics.pstdev(log_returns) * math.sqrt(365) * 100
+    assert stats.realized_vol_30d == pytest.approx(expected_vol)
+    expected_m30 = (closes[-1] - closes[0]) / closes[0] * 100
+    assert stats.momentum_30d == pytest.approx(expected_m30)
+    expected_m7 = (closes[-1] - closes[-8]) / closes[-8] * 100
+    assert stats.momentum_7d == pytest.approx(expected_m7)
+
+
+@pytest.mark.asyncio
+async def test_vol_command_with_mock_klines():
+    urls = {cp.BINANCE_KLINES_URL: KLINES_30}
+    out = await cp.run_vol(FakeSession(urls))
+    assert "Realized Vol:" in out
+    closes = CLOSES_30
+    log_returns = [math.log(closes[i] / closes[i - 1]) for i in range(1, len(closes))]
+    expected_vol = statistics.pstdev(log_returns) * math.sqrt(365) * 100
+    assert f"{expected_vol:.2f}%" in out
+
+
+@pytest.mark.asyncio
+async def test_vol_command_unavailable():
+    out = await cp.run_vol(FakeSession(exc=aiohttp.ClientError("down")))
+    assert out == "UNAVAILABLE"
+
+
+def test_compute_vol_stats_bad_input():
+    assert cp.compute_vol_stats([]) is None
+    assert cp.compute_vol_stats("nope") is None
+    assert cp.compute_vol_stats([["x"]]) is None  # malformed rows skipped -> <2 closes
+
+
+# --------------------------------------------------------------------------- #
+# Global stats parsing
+# --------------------------------------------------------------------------- #
+def test_parse_global():
+    g = cp.parse_global(GLOBAL_JSON)
+    assert g is not None
+    assert g.btc_dominance == 42.53
+    assert g.total_market_cap == 2_840_000_000_000.0
+    assert cp.fmt_money(g.total_market_cap) == "$2.84T"
+
+
+# --------------------------------------------------------------------------- #
+# 3) Report renders with all sources down (all UNAVAILABLE)
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_report_all_unavailable():
+    out = await cp.run_report(FakeSession(exc=aiohttp.ClientError("down")))
+    assert "UNAVAILABLE" in out
+    # One UNAVAILABLE per section: funding, vol, global.
+    assert out.count("UNAVAILABLE") == 3
+
+
+@pytest.mark.asyncio
+async def test_report_full_render():
+    urls = {
+        cp.BINANCE_FAPI_URL: BINANCE_FUNDING_JSON,
+        cp.BYBIT_V5_URL: BYBIT_FUNDING_JSON,
+        cp.BINANCE_KLINES_URL: KLINES_30,
+        cp.COINGECKO_GLOBAL_URL: GLOBAL_JSON,
+    }
+    out = await cp.run_report(FakeSession(urls))
+    assert "crypto-pulse :: terminal market report" in out
+    assert "generated:" in out
+    assert "UNAVAILABLE" not in out
+    assert "BTC Dominance" in out
+    assert "XRPUSDT" in out
+
+
+# --------------------------------------------------------------------------- #
+# Table rendering sanity
+# --------------------------------------------------------------------------- #
+def test_render_table_aligns_and_bars():
+    table = cp.render_table(
+        ["A", "B"],
+        [["1", "2"]],
+        aligns=["left", "right"],
+    )
+    assert "A" in table and "B" in table
+    assert "─" in table
+
+
+def test_render_funding_table_empty():
+    out = cp.render_funding_table(
+        [cp.FundingRate(symbol="X", venue="Bybit", rate=0.0)], top_n=5
+    )
+    assert "X" in out
