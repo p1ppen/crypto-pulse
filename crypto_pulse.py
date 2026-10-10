@@ -37,6 +37,9 @@ REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=8)
 # Binance funds 3x/day, Bybit 3x/day -> 3 * 365 funding events per year.
 FUNDING_PERIODS_PER_YEAR = 3 * 365
 
+# Default top-N symbols watched by the open-interest scanner.
+DEFAULT_OI_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT"]
+
 
 # --------------------------------------------------------------------------- #
 # Data models
@@ -62,6 +65,13 @@ class VolStats:
 class GlobalStats:
     total_market_cap: float
     btc_dominance: float
+
+
+@dataclass(frozen=True)
+class OpenInterest:
+    symbol: str
+    venue: str
+    oi: float  # open interest in contracts / coins
 
 
 # --------------------------------------------------------------------------- #
@@ -377,6 +387,184 @@ async def fetch_global_stats(
 
 
 # --------------------------------------------------------------------------- #
+# Open interest scanner
+# --------------------------------------------------------------------------- #
+# Each venue exposes OI as a *point-in-time* snapshot. Binance returns a single
+# object per symbol; Bybit returns a short time-series (take the latest entry);
+# OKX returns one entry per instId. All OI values are strings and parsed with
+# the shared _safe_float helper.
+BINANCE_OI_BASE = "https://fapi.binance.com/fapi/v1/openInterest"
+BYBIT_OI_BASE = "https://api.bybit.com/v5/market/open-interest"
+OKX_OI_BASE = "https://www.okx.com/api/v5/public/open-interest"
+
+# OKX quotes its perpetual swaps as "<BASE>-<QUOTE>-SWAP" (e.g. BTC-USDT-SWAP),
+# while exchange-native symbols are "<BASE><QUOTE>" (e.g. BTCUSDT). Map between
+# the two by peeling off a known quote suffix.
+_OKX_QUOTES = ("USDT", "BUSD", "USDC", "USDP", "FDUSD", "EURT", "DAI")
+
+
+def okx_inst_id(symbol: str) -> str:
+    """Convert an exchange-native symbol to its OKX instId, e.g. BTCUSDT -> BTC-USDT-SWAP."""
+    for quote in _OKX_QUOTES:
+        if symbol.endswith(quote) and len(symbol) > len(quote):
+            base = symbol[: -len(quote)]
+            return f"{base}-{quote}-SWAP"
+    return f"{symbol}-SWAP"
+
+
+def binance_oi_url(symbol: str) -> str:
+    return f"{BINANCE_OI_BASE}?symbol={symbol}"
+
+
+def bybit_oi_url(symbol: str) -> str:
+    return (
+        f"{BYBIT_OI_BASE}?category=linear&symbol={symbol}"
+        f"&intervalTime=1h&limit=2"
+    )
+
+
+def okx_oi_url(symbol: str) -> str:
+    return f"{OKX_OI_BASE}?instType=SWAP&instId={okx_inst_id(symbol)}"
+
+
+def parse_binance_oi(data: Any, symbol: str) -> Optional[OpenInterest]:
+    if not isinstance(data, dict):
+        return None
+    oi = _safe_float(data.get("openInterest"))
+    if oi is None:
+        return None
+    return OpenInterest(symbol=symbol, venue="Binance", oi=oi)
+
+
+def parse_bybit_oi(data: Any, symbol: str) -> Optional[OpenInterest]:
+    lst = ((data or {}).get("result", {}) or {}).get("list", [])
+    if not isinstance(lst, list) or not lst:
+        return None
+    # limit=2 returns the two most-recent hourly buckets; keep the latest.
+    item = lst[-1]
+    if not isinstance(item, dict):
+        return None
+    oi = _safe_float(item.get("openInterest"))
+    if oi is None:
+        return None
+    return OpenInterest(symbol=symbol, venue="Bybit", oi=oi)
+
+
+def parse_okx_oi(data: Any, symbol: str) -> Optional[OpenInterest]:
+    payload = (data or {}).get("data", [])
+    if not isinstance(payload, list) or not payload:
+        return None
+    target = okx_inst_id(symbol)
+    for e in payload:
+        if isinstance(e, dict) and e.get("instId") == target:
+            oi = _safe_float(e.get("oi"))
+            if oi is None:
+                return None
+            return OpenInterest(symbol=symbol, venue="OKX", oi=oi)
+    # Returned a payload but no bucket matches our instId -> mismatch.
+    return None
+
+
+async def fetch_binance_oi(
+    session: aiohttp.ClientSession, symbol: str, timeout: aiohttp.ClientTimeout
+) -> Optional[OpenInterest]:
+    try:
+        data = await fetch_json(session, binance_oi_url(symbol), timeout)
+    except Exception:
+        return None
+    try:
+        return parse_binance_oi(data, symbol)
+    except Exception:
+        return None
+
+
+async def fetch_bybit_oi(
+    session: aiohttp.ClientSession, symbol: str, timeout: aiohttp.ClientTimeout
+) -> Optional[OpenInterest]:
+    try:
+        data = await fetch_json(session, bybit_oi_url(symbol), timeout)
+    except Exception:
+        return None
+    try:
+        return parse_bybit_oi(data, symbol)
+    except Exception:
+        return None
+
+
+async def fetch_okx_oi(
+    session: aiohttp.ClientSession, symbol: str, timeout: aiohttp.ClientTimeout
+) -> Optional[OpenInterest]:
+    try:
+        data = await fetch_json(session, okx_oi_url(symbol), timeout)
+    except Exception:
+        return None
+    try:
+        return parse_okx_oi(data, symbol)
+    except Exception:
+        return None
+
+
+async def gather_open_interest(
+    session: aiohttp.ClientSession,
+    symbols: list[str],
+    timeout: aiohttp.ClientTimeout,
+) -> dict[str, dict[str, Optional[OpenInterest]]]:
+    """Fetch OI for every symbol across Binance, Bybit and OKX.
+
+    Returns a mapping ``{symbol: {"Binance": OI | None, "Bybit": ..., "OKX": ...}}``
+    so the per-venue availability is preserved (a single failing venue for a symbol
+    is represented as ``None`` rather than dropping the whole symbol).
+    """
+    async def _fetch_for_symbol(symbol: str) -> tuple[str, dict[str, Optional[OpenInterest]]]:
+        b, by, ok = await asyncio.gather(
+            fetch_binance_oi(session, symbol, timeout),
+            fetch_bybit_oi(session, symbol, timeout),
+            fetch_okx_oi(session, symbol, timeout),
+        )
+        return symbol, {"Binance": b, "Bybit": by, "OKX": ok}
+
+    results = await asyncio.gather(
+        *(_fetch_for_symbol(s) for s in symbols)
+    )
+    return {symbol: oi for symbol, oi in results}
+
+
+def fmt_oi(n: float) -> str:
+    """Compact, thousands-aware rendering of a raw contract/coin amount."""
+    if abs(n) >= 1e9:
+        return f"{n / 1e9:,.2f}B"
+    if abs(n) >= 1e6:
+        return f"{n / 1e6:,.2f}M"
+    if abs(n) >= 1e3:
+        return f"{n / 1e3:,.2f}K"
+    return f"{n:,.0f}"
+
+
+def render_oi_table(oi_map: dict[str, dict[str, Optional[OpenInterest]]]) -> str:
+    headers = ["SYMBOL", "BINANCE_OI", "BYBIT_OI", "OKX_OI", "TOTAL"]
+    venues = ["Binance", "Bybit", "OKX"]
+    entries: list[tuple[float, list[str]]] = []
+    for symbol, per_venue in oi_map.items():
+        total = 0.0
+        all_none = True
+        cells: list[str] = [symbol]
+        for venue in venues:
+            oi = per_venue.get(venue)
+            if oi is None:
+                cells.append("UNAVAILABLE")
+            else:
+                cells.append(fmt_oi(oi.oi))
+                total += oi.oi
+                all_none = False
+        cells.append("UNAVAILABLE" if all_none else fmt_oi(total))
+        entries.append((total, cells))
+    # Sort by total descending; fully-unavailable rows (total 0.0) sink to the bottom.
+    entries.sort(key=lambda e: e[0], reverse=True)
+    rows = [cells for _, cells in entries]
+    return render_table(headers, rows, aligns=["left", "right", "right", "right", "right"])
+
+
+# --------------------------------------------------------------------------- #
 # Formatting helpers
 # --------------------------------------------------------------------------- #
 def fmt_money(n: float) -> str:
@@ -526,6 +714,39 @@ async def run_report(session: Optional[aiohttp.ClientSession] = None) -> str:
     return render_report(rates, vol, glob)
 
 
+def parse_symbols(value: Optional[str]) -> Optional[list[str]]:
+    """Turn a comma-separated ``--symbols`` value into a clean symbol list."""
+    if not value or not value.strip():
+        return None
+    return [part.strip().upper() for part in value.split(",") if part.strip()]
+
+
+async def run_oi(
+    session: Optional[aiohttp.ClientSession] = None,
+    symbols: Optional[list[str]] = None,
+) -> str:
+    symbols = symbols or DEFAULT_OI_SYMBOLS
+    async with _session(session) as s:
+        oi_map = await gather_open_interest(s, symbols, REQUEST_TIMEOUT)
+
+    now = dt.datetime.now(dt.timezone.utc)
+    lines: list[str] = []
+    lines.append("=" * 62)
+    lines.append(" crypto-pulse :: open interest scanner (point-in-time snapshot)")
+    lines.append("=" * 62)
+    lines.append(f" generated: {now:%Y-%m-%d %H:%M:%S UTC}")
+    lines.append("")
+    lines.append("Note: OI is a point-in-time snapshot in contracts/coins (not USD).")
+    lines.append("      Change-over-time ('top-movers') needs repeated snapshots;")
+    lines.append("      this run reports current open interest only.")
+    lines.append("")
+    lines.append("Values: contracts on Binance/Bybit, coins on OKX.")
+    lines.append("-" * 62)
+    lines.append(render_oi_table(oi_map))
+    lines.append("=" * 62)
+    return "\n".join(lines)
+
+
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
@@ -548,6 +769,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub.add_parser("vol", help="BTC 30d realized volatility, momentum & price range.")
     sub.add_parser("report", help="Full terminal market report.")
+    oi_p = sub.add_parser(
+        "oi",
+        help="Open interest scanner for Binance, Bybit and OKX.",
+    )
+    oi_p.add_argument(
+        "--symbols",
+        metavar="SYMBOLS",
+        default=None,
+        help="Comma-separated symbol list, e.g. --symbols BTCUSDT,ETHUSDT. "
+        "Defaults to BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,DOGEUSDT.",
+    )
     return parser
 
 
@@ -559,6 +791,8 @@ def main(argv: Optional[list[str]] = None) -> None:
         out = asyncio.run(run_vol())
     elif args.command == "report":
         out = asyncio.run(run_report())
+    elif args.command == "oi":
+        out = asyncio.run(run_oi(symbols=parse_symbols(args.symbols)))
     else:  # pragma: no cover - argparse guards this
         raise SystemExit("unknown command")
     print(out)

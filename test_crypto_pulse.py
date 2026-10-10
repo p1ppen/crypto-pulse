@@ -428,3 +428,223 @@ def test_render_funding_table_empty():
         [cp.FundingRate(symbol="X", venue="Bybit", rate=0.0)], top_n=5
     )
     assert "X" in out
+
+
+# --------------------------------------------------------------------------- #
+# 4) Open interest scanner
+# --------------------------------------------------------------------------- #
+# Sample OKI payloads (shapes verified against the live endpoints).
+BINANCE_OI_JSON = {"symbol": "BTCUSDT", "openInterest": "9543210.00", "time": 1700000000}
+BINANCE_OI_ETH = {"symbol": "ETHUSDT", "openInterest": "5123456.78", "time": 1700000001}
+BYBIT_OI_JSON = {
+    "retCode": 0,
+    "result": {"list": [
+        {"openInterest": "19000000.5", "timestamp": "1700000000"},
+        {"openInterest": "19100000.9", "timestamp": "17000003600"},
+    ]},
+    "time": "17000003600",
+}
+OKX_OI_JSON = {"code": "0", "data": [{"oi": "26345678", "instId": "BTC-USDT-SWAP", "ts": "1700000000"}]}
+OKX_OI_ETH = {"code": "0", "data": [{"oi": "8800000", "instId": "ETH-USDT-SWAP"}]}
+
+
+# --- OKX symbol mapping --------------------------------------------------- #
+def test_okx_inst_id_mapping():
+    assert cp.okx_inst_id("BTCUSDT") == "BTC-USDT-SWAP"
+    assert cp.okx_inst_id("ETHUSDT") == "ETH-USDT-SWAP"
+    assert cp.okx_inst_id("SOLUSDT") == "SOL-USDT-SWAP"
+    assert cp.okx_inst_id("XRPUSDT") == "XRP-USDT-SWAP"
+    assert cp.okx_inst_id("DOGEUSDT") == "DOGE-USDT-SWAP"
+    # Non-USDT quote still splits correctly.
+    assert cp.okx_inst_id("BTCBUSD") == "BTC-BUSD-SWAP"
+    # Unknown quote falls back to a -SWAP id rather than mangling the base.
+    assert cp.okx_inst_id("BTCTX") == "BTCTX-SWAP"
+
+
+def test_okx_oi_url_uses_mapped_instid():
+    url = cp.okx_oi_url("BTCUSDT")
+    assert "instId=BTC-USDT-SWAP" in url
+    assert url.startswith(cp.OKX_OI_BASE)
+
+
+# --- Parsing each venue's response shape ---------------------------------- #
+def test_parse_binance_oi():
+    oi = cp.parse_binance_oi(BINANCE_OI_JSON, "BTCUSDT")
+    assert oi is not None
+    assert oi.symbol == "BTCUSDT"
+    assert oi.venue == "Binance"
+    assert oi.oi == 9543210.0
+
+
+def test_parse_binance_oi_rejects_bad_input():
+    assert cp.parse_binance_oi("nope", "BTCUSDT") is None
+    assert cp.parse_binance_oi({"no_interest": 1}, "BTCUSDT") is None  # missing field
+    assert cp.parse_binance_oi({"openInterest": "not-a-number"}, "BTCUSDT") is None
+
+
+def test_parse_bybit_oi_takes_latest_bucket():
+    oi = cp.parse_bybit_oi(BYBIT_OI_JSON, "BTCUSDT")
+    assert oi is not None
+    assert oi.venue == "Bybit"
+    # limit=2 -> two buckets; latest entry is 19100000.9.
+    assert oi.oi == 19100000.9
+
+
+def test_parse_bybit_oi_rejects_bad_input():
+    assert cp.parse_bybit_oi({}, "BTCUSDT") is None
+    assert cp.parse_bybit_oi({"result": {"list": []}}, "BTCUSDT") is None
+    assert cp.parse_bybit_oi({"result": {"list": [{"no_interest": 1}]}}, "BTCUSDT") is None
+
+
+def test_parse_okx_oi_matches_instid():
+    oi = cp.parse_okx_oi(OKX_OI_JSON, "BTCUSDT")
+    assert oi is not None
+    assert oi.venue == "OKX"
+    assert oi.oi == 26345678.0
+
+
+def test_parse_okx_oi_rejects_instid_mismatch():
+    # Payload returned for a different instId -> treated as unavailable.
+    data = {"code": "0", "data": [{"oi": "1", "instId": "ETH-USDT-SWAP"}]}
+    assert cp.parse_okx_oi(data, "BTCUSDT") is None
+
+
+def test_parse_okx_oi_rejects_bad_input():
+    assert cp.parse_okx_oi({}, "BTCUSDT") is None
+    assert cp.parse_okx_oi({"data": [{"instId": "BTC-USDT-SWAP"}]}, "BTCUSDT") is None  # missing oi
+
+
+# --- Table rendering ------------------------------------------------------- #
+def test_render_oi_table_all_venues_present():
+    oi_map = {
+        "BTCUSDT": {
+            "Binance": cp.OpenInterest("BTCUSDT", "Binance", 1_000_000.0),
+            "Bybit": cp.OpenInterest("BTCUSDT", "Bybit", 3_000_000.0),
+            "OKX": cp.OpenInterest("BTCUSDT", "OKX", 2_000_000.0),
+        }
+    }
+    out = cp.render_oi_table(oi_map)
+    assert "SYMBOL" in out and "BINANCE_OI" in out
+    assert "BYBIT_OI" in out and "OKX_OI" in out and "TOTAL" in out
+    assert "1.00M" in out and "3.00M" in out and "2.00M" in out
+    assert "6.00M" in out  # total
+    assert "UNAVAILABLE" not in out
+
+
+def test_render_oi_table_sorted_by_total_desc():
+    oi_map = {
+        "ETHUSDT": {
+            "Binance": cp.OpenInterest("ETHUSDT", "Binance", 100_000.0),
+            "Bybit": cp.OpenInterest("ETHUSDT", "Bybit", 100_000.0),
+            "OKX": cp.OpenInterest("ETHUSDT", "OKX", 100_000.0),
+        },
+        "BTCUSDT": {
+            "Binance": cp.OpenInterest("BTCUSDT", "Binance", 5_000_000.0),
+            "Bybit": cp.OpenInterest("BTCUSDT", "Bybit", 5_000_000.0),
+            "OKX": cp.OpenInterest("BTCUSDT", "OKX", 5_000_000.0),
+        },
+    }
+    out = cp.render_oi_table(oi_map)
+    # BTCUSDT (15M total) should appear above ETHUSDT (300K total).
+    assert out.index("BTCUSDT") < out.index("ETHUSDT")
+
+
+def test_render_oi_table_one_venue_down():
+    oi_map = {
+        "BTCUSDT": {
+            "Binance": cp.OpenInterest("BTCUSDT", "Binance", 1_000_000.0),
+            "Bybit": cp.OpenInterest("BTCUSDT", "Bybit", 2_000_000.0),
+            "OKX": None,
+        }
+    }
+    out = cp.render_oi_table(oi_map)
+    assert "UNAVAILABLE" in out  # OKX cell
+    assert "1.00M" in out and "2.00M" in out
+    assert "3.00M" in out  # total of the two available venues
+
+
+def test_render_oi_table_all_venues_down():
+    oi_map = {"DOGEUSDT": {"Binance": None, "Bybit": None, "OKX": None}}
+    out = cp.render_oi_table(oi_map)
+    # All cells -> UNAVAILABLE, including the TOTAL.
+    assert out.count("UNAVAILABLE") == 4
+
+
+# --- End-to-end (mocked, no network) --------------------------------------- #
+@pytest.mark.asyncio
+async def test_oi_command_full_render():
+    urls = {
+        cp.binance_oi_url("BTCUSDT"): BINANCE_OI_JSON,
+        cp.bybit_oi_url("BTCUSDT"): BYBIT_OI_JSON,
+        cp.okx_oi_url("BTCUSDT"): OKX_OI_JSON,
+    }
+    out = await cp.run_oi(FakeSession(urls), symbols=["BTCUSDT"])
+    assert "open interest scanner" in out
+    assert "BTCUSDT" in out
+    # Binance 9,543,210 ~= 9.54M, Bybit latest 19,100,000.9 ~= 19.10M, OKX 26,345,678 ~= 26.35M
+    assert "9.54M" in out
+    assert "19.10M" in out
+    assert "26.35M" in out
+    # Total ~= 54,988,888.9 -> 54.99M
+    assert "54.99M" in out
+    # Snapshot note present.
+    assert "point-in-time snapshot" in out
+    assert "UNAVAILABLE" not in out
+
+
+@pytest.mark.asyncio
+async def test_oi_command_one_venue_down():
+    # OKX URL not canned -> FakeSession raises -> OKX cell UNAVAILABLE; rest render.
+    urls = {
+        cp.binance_oi_url("BTCUSDT"): BINANCE_OI_JSON,
+        cp.bybit_oi_url("BTCUSDT"): BYBIT_OI_JSON,
+    }
+    out = await cp.run_oi(FakeSession(urls), symbols=["BTCUSDT"])
+    assert "UNAVAILABLE" in out            # OKX cell
+    assert "9.54M" in out and "19.10M" in out
+
+
+@pytest.mark.asyncio
+async def test_oi_command_all_down_renders_table():
+    out = await cp.run_oi(FakeSession(exc=aiohttp.ClientError("down")), symbols=["BTCUSDT"])
+    # Per-cell availability: every cell UNAVAILABLE, total UNAVAILABLE.
+    assert out.count("UNAVAILABLE") == 4
+    assert "open interest scanner" in out
+
+
+@pytest.mark.asyncio
+async def test_oi_command_symbols_flag_overrides_default(caplog):
+    # Provide ETH only; ensure only ETH columns are queried (no BTC requests).
+    urls = {
+        cp.binance_oi_url("ETHUSDT"): BINANCE_OI_ETH,
+        cp.bybit_oi_url("ETHUSDT"): {"retCode": 0, "result": {"list": [{"openInterest": "8000000", "timestamp": "1"}]}},
+        cp.okx_oi_url("ETHUSDT"): OKX_OI_ETH,
+    }
+    sess = FakeSession(urls)
+    out = await cp.run_oi(sess, symbols=["ETHUSDT"])
+    assert "ETHUSDT" in out
+    # No BTCUSDT should have been requested.
+    assert not any("BTCUSDT" in u for u in sess.calls)
+    # --symbols comma parsing
+    assert cp.parse_symbols("btcusdt, ethusdt") == ["BTCUSDT", "ETHUSDT"]
+    assert cp.parse_symbols("") is None
+    assert cp.parse_symbols("   ") is None
+
+
+@pytest.mark.asyncio
+async def test_oi_command_default_symbols_used_when_none():
+    sess = FakeSession(exc=aiohttp.ClientError("down"))
+    await cp.run_oi(sess)  # no symbols -> defaults
+    # 5 default symbols * 3 venues = 15 URL calls attempted.
+    assert len(sess.calls) == 3 * len(cp.DEFAULT_OI_SYMBOLS)
+
+
+# --------------------------------------------------------------------------- #
+# 5) CLI wiring
+# --------------------------------------------------------------------------- #
+def test_cli_oi_subcommand_and_symbols():
+    ns = cp.build_parser().parse_args(["oi"])
+    assert ns.command == "oi"
+    assert ns.symbols is None
+    ns2 = cp.build_parser().parse_args(["oi", "--symbols", "BTCUSDT,ETHUSDT"])
+    assert ns2.symbols == "BTCUSDT,ETHUSDT"

@@ -30,6 +30,8 @@ pip install pytest pytest-asyncio
 python crypto_pulse.py funding                       # Top 15 most extreme funding rates
 python crypto_pulse.py funding --venue bitget        # Top 15 for Bitget only (case-insensitive)
 python crypto_pulse.py vol                           # BTC 30d realized vol, momentum, price range
+python crypto_pulse.py oi                            # Open interest scanner (Binance / Bybit / OKX)
+python crypto_pulse.py oi --symbols BTCUSDT,ETHUSDT  # Override the default symbol list
 python crypto_pulse.py report                        # Full terminal market report
 ```
 
